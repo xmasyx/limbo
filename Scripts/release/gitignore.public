@@ -1,0 +1,17 @@
+# Build
+.build/
+.swiftpm/
+dist/
+*.xcodeproj
+.DS_Store
+
+# Bench output: a screenshot of a live session shows whatever was on screen.
+campo/
+
+# Working notes — the spec, the handoff and the release sweep stay private.
+# These files are not in this tree; the lines cost nothing and fail closed the
+# day somebody copies one in.
+ISA.md
+ISA.html
+RIPRESA.md
+Scripts/release/identity.pattern

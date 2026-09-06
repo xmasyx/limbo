@@ -1,0 +1,192 @@
+name: Release
+
+# Tag a commit and the release builds itself:
+#
+#   git tag v0.6.0 && git push origin v0.6.0
+#
+# Produces Limbo.zip (what the Homebrew cask downloads) and Limbo-<version>.dmg
+# (for whoever grabs it by hand) and attaches both to a GitHub Release. It can
+# also be run by hand from the Actions tab on a branch: without a tag it builds
+# and uploads an artifact and publishes nothing, which is how a change to this
+# file gets tried before main ever sees it.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the release
+
+jobs:
+  build:
+    runs-on: macos-15
+
+    steps:
+      # An ad-hoc signature changes identity on every build, and macOS then
+      # treats the update as a new app and forgets the permissions already
+      # granted. Without the key there is no acceptable fallback, so the runner
+      # says so before spending time on a build that cannot ship.
+      - name: Signing secrets preflight
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [[ -z "$MACOS_CERT_P12" ]]; then
+            echo "::error::MACOS_CERT_P12 is missing: Scripts/make-signing-cert.sh creates the identity; export it as a .p12, then base64 -i cert.p12 | pbcopy and paste it into the repository secret"
+            exit 1
+          fi
+          if [[ -z "$MACOS_CERT_PASSWORD" ]]; then
+            echo "::error::MACOS_CERT_PASSWORD is missing: save the password used to export the .p12 in the repository secret"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Run tests
+        run: swift test
+
+      # `-T` alone is not enough: without the partition list the first codesign
+      # waits on an invisible Keychain dialog that nobody can close on a runner.
+      - name: Import signing certificate
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/limbo-signing.keychain-db"
+          KEYCHAIN_PASSWORD="limbo-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          P12="$RUNNER_TEMP/limbo-signing.p12"
+          CERT="$RUNNER_TEMP/limbo-signing.pem"
+
+          printf '%s' "$MACOS_CERT_P12" | base64 -D > "$P12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # A freshly created keychain re-locks itself after 300 seconds, and a
+          # slow build then leaves codesign hanging forever on an unlock dialog.
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          EXISTING_KEYCHAINS=()
+          while IFS= read -r existing; do
+            EXISTING_KEYCHAINS+=("$existing")
+          done < <(security list-keychains -d user \
+            | sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
+          security list-keychains -d user -s "$KEYCHAIN" "${EXISTING_KEYCHAINS[@]}"
+          security import "$P12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -A -T /usr/bin/codesign
+          # An imported self-signed certificate is not yet TRUSTED, and
+          # `find-identity -v` skips untrusted identities: without this the
+          # signature would not find «Limbo Dev» and build-app.sh would exit 6.
+          # Trust goes in the admin domain with sudo: the user form opens an
+          # authorization dialog no one can close on a headless runner.
+          security find-certificate -c "Limbo Dev" -p "$KEYCHAIN" > "$CERT"
+          sudo security add-trusted-cert -d -r trustRoot -p codeSign \
+            -k /Library/Keychains/System.keychain "$CERT"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security find-identity -v -p codesigning "$KEYCHAIN" | grep -q "Limbo Dev" \
+            || { echo "::error::the .p12 does not contain the Limbo Dev signing identity"; exit 1; }
+
+      - name: Build Limbo.app
+        env:
+          LIMBO_SKIP_INSTALL: "1"   # a CI runner has no /Applications to own
+          LIMBO_RELEASE: "1"        # ad-hoc is forbidden for a published artifact
+        run: |
+          # On a tag the TAG is the version: the app must not be free to say
+          # something else. Off a tag there is no version to claim.
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            export LIMBO_VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          ./Scripts/build-app.sh "$PWD/dist"
+
+      - name: Verify the signature
+        run: |
+          APP=dist/Limbo.app
+          codesign -dv --verbose=2 "$APP" 2>&1 | grep -q 'Authority=Limbo Dev'
+          codesign --verify --deep --strict "$APP"
+
+      # `Authority=<Name> Dev` is a check on the NAME, and another self-signed
+      # certificate with the same common name would pass it: macOS does not look
+      # at the string, it looks at the designated requirement, and a different
+      # identity wipes the permissions already granted. Here the leaf fingerprint
+      # is pinned to the real identity.
+      - name: Pin the signing identity
+        run: |
+          APP="dist/Limbo.app"
+          REQ='identifier "app.limbo.mac" and certificate leaf = H"FC7B15153CE8BF7D484161598F0CC05C3AF5E625"'
+          codesign --verify --strict -R="$REQ" "$APP" \
+            || { echo "::error::the bundle does not meet the pinned designated requirement"; exit 1; }
+
+      # The button's logic in the sources does not prove the SHIPPED binary
+      # exposes it: Otium published three releases without it and no gate said so.
+      - name: The published binary carries the update button
+        run: |
+          strings "dist/Limbo.app/Contents/MacOS/Limbo" | grep -qF 'Verifica aggiornamenti' \
+            || { echo "::error::the binary does not contain the update button"; exit 1; }
+
+      - name: Verify the bundle
+        run: |
+          APP=dist/Limbo.app
+          test -x "$APP/Contents/MacOS/Limbo"          || { echo "::error::no executable in the bundle"; exit 1; }
+          test -f "$APP/Contents/Resources/Limbo.icns" || { echo "::error::the bundle has no icon"; exit 1; }
+          ARCHS="$(lipo -archs "$APP/Contents/MacOS/Limbo")"
+          echo "the bundle carries: ${ARCHS}"
+          [[ "${ARCHS}" == "arm64" ]] \
+            || { echo "::error::the bundle must carry only arm64 (it carries: ${ARCHS})"; exit 1; }
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
+          echo "the bundle says: ${VERSION}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            EXPECTED="${GITHUB_REF_NAME#v}"
+            [[ "${VERSION}" == "${EXPECTED}" ]] \
+              || { echo "::error::tag says ${EXPECTED}, the bundle says ${VERSION}"; exit 1; }
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Zip it
+        run: ditto -c -k --keepParent dist/Limbo.app Limbo.zip
+
+      # The DMG, for whoever downloads by hand instead of using Homebrew.
+      - name: Make the DMG
+        run: |
+          DMG="Limbo-${VERSION}.dmg"
+          STAGE="$(mktemp -d)"
+          cp -R "dist/Limbo.app" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname "Limbo ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+
+          # A DMG that builds without errors can still hold a broken bundle, and
+          # the difference only shows when it is mounted. Better here than in
+          # somebody's Downloads folder.
+          MNT="$(hdiutil attach "$DMG" -nobrowse -readonly | grep -o '/Volumes/.*' | head -1)"
+          trap 'hdiutil detach "$MNT" -quiet 2>/dev/null || true' EXIT
+          test -x "$MNT/Limbo.app/Contents/MacOS/Limbo" \
+            || { echo "::error::no executable inside the DMG"; exit 1; }
+          codesign -dv --verbose=2 "$MNT/Limbo.app" 2>&1 | grep -q 'Authority=Limbo Dev' \
+            || { echo "::error::the app inside the DMG is not signed by Limbo Dev"; exit 1; }
+          codesign --verify --deep --strict "$MNT/Limbo.app" \
+            || { echo "::error::the signature does not hold inside the DMG"; exit 1; }
+          echo "DMG=$DMG" >> "$GITHUB_ENV"
+
+      - name: Upload the artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Limbo
+          path: |
+            Limbo.zip
+            ${{ env.DMG }}
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            Limbo.zip
+            ${{ env.DMG }}
+          generate_release_notes: true
+
+      # The keychain holds the release private key: it goes even when an earlier
+      # gate turned red, not only on the happy path.
+      - name: Delete temporary keychain
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/limbo-signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/limbo-signing.p12" "$RUNNER_TEMP/limbo-signing.pem"
