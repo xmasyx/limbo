@@ -935,8 +935,28 @@ enum SelfTests {
                           dxCentro < 2))
             prove.append(("ha una misura vera, non zero",
                           f.width > 200 && f.height > 120))
-            prove.append((String(format: "staccata dal bordo alto (%.0f pt sotto)", quantoSotto),
-                          quantoSotto > 20))
+            // Il difetto da prendere è quello del 19/08: la finestra in alto a
+            // SINISTRA, incollata alla barra dei menu, perché lo stile assegnato
+            // dopo il costruttore rifaceva il telaio. Il metro non può essere una
+            // distanza fissa dal bordo (la soglia dei 20 pt bocciava il runner
+            // della CI, schermo piccolo e finestra alta: 2 pt, ma centrata) e
+            // nemmeno la simmetria, perché `center()` di Apple mette la finestra
+            // un po' SOPRA il centro (84 pt sopra contro 249 sotto, misurato).
+            // Quello che vale su ogni schermo: sta sotto la barra dei menu, e ci
+            // sta dentro tutta.
+            let quantoSopra = f.minY - schermo.visibleFrame.minY
+            prove.append((String(format: "sotto la barra dei menu (%.0f pt)", quantoSotto),
+                          quantoSotto > 0))
+            prove.append((String(format: "tutta dentro lo schermo (%.0f pt liberi sotto)",
+                                 quantoSopra),
+                          schermo.visibleFrame.insetBy(dx: -1, dy: -1).contains(f)))
+            // Polo negativo: la finestra del difetto, in alto a sinistra.
+            let difetto = NSRect(x: schermo.visibleFrame.minX,
+                                 y: schermo.visibleFrame.maxY - f.height,
+                                 width: f.width, height: f.height)
+            prove.append(("polo negativo: in alto a sinistra non passa",
+                          !(schermo.visibleFrame.maxY - difetto.maxY > 0)
+                            && abs(difetto.midX - schermo.visibleFrame.midX) >= 2))
         }
 
         return esito("banco di quello che e' arrivato il 19/08", prove)

@@ -26,7 +26,7 @@ SOURCE="$PWD"
 DESTINATION="${1:-$(cd .. && pwd)/Limbo-release}"
 NAME="xmasyx"
 EMAIL="16624475+xmasyx@users.noreply.github.com"
-SUBJECT="Limbo — what you are moving, while you move it"
+SUBJECT="${LIMBO_SUBJECT:-Limbo — what you are moving, while you move it}"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'STOPPED: %s\n' "$*" >&2; exit 1; }
@@ -67,14 +67,29 @@ fi
 say "==> source      $SOURCE at $(git -C "$SOURCE" rev-parse --short HEAD)"
 say "==> destination $DESTINATION"
 
-# From zero. A destination emptied instead of deleted keeps whatever the last
-# run left behind.
+# The FILES come from zero every time — a destination emptied instead of rebuilt
+# keeps whatever the last run left behind. The HISTORY does not: once this tree
+# has been published, throwing its history away would mean force-pushing over a
+# repo other people may have cloned. So an existing `.git` is kept and the
+# rebuild lands on top of it as a normal commit; `LIMBO_FRESH_HISTORY=1` starts
+# over, which is right exactly once, before the first push.
+REUSE=0
+KEPT=""
 if [ -e "$DESTINATION" ]; then
-  [ -d "$DESTINATION/.git" ] || [ -z "$(ls -A "$DESTINATION" 2>/dev/null)" ] \
-    || die "$DESTINATION exists and is not a git tree; not deleting it"
+  if [ -d "$DESTINATION/.git" ] && [ "${LIMBO_FRESH_HISTORY:-0}" != "1" ]; then
+    REUSE=1
+    KEPT="$(mktemp -d)/git"
+    mv "$DESTINATION/.git" "$KEPT" || die "cannot set the existing history aside"
+    say "==> keeping the history already there"
+  elif [ -d "$DESTINATION/.git" ] || [ -z "$(ls -A "$DESTINATION" 2>/dev/null)" ]; then
+    :
+  else
+    die "$DESTINATION exists and is not a git tree; not deleting it"
+  fi
   rm -rf "$DESTINATION"
 fi
 mkdir -p "$DESTINATION"
+[ "$REUSE" = "1" ] && { mv "$KEPT" "$DESTINATION/.git" || die "cannot restore the history"; }
 
 # Only what the source TRACKS, minus what the public .gitignore names. Using
 # `git ls-files` and not a copy of the directory means anything ignored here —
@@ -89,12 +104,16 @@ say "==> copying $COUNT tracked files"
 cp "$SOURCE/Scripts/release/gitignore.public" "$DESTINATION/.gitignore"
 
 cd "$DESTINATION" || die "cannot enter $DESTINATION"
-git init -q
+[ "$REUSE" = "1" ] || git init -q
 # LOCAL, never inherited: the global identity on this machine is a real name.
 git config user.name "$NAME"
 git config user.email "$EMAIL"
 git add -A
-git -c commit.gpgsign=false commit -q -m "$SUBJECT" || die "the commit failed"
+if git diff --cached --quiet && [ "$REUSE" = "1" ]; then
+  say "==> the tree is already what the source says; no commit"
+else
+  git -c commit.gpgsign=false commit -q -m "$SUBJECT" || die "the commit failed"
+fi
 
 say ""
 say "=== the gates, on the tree that was just built ======================"
