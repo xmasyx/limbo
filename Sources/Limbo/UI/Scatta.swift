@@ -277,6 +277,35 @@ enum Scatta {
             esiti.append(("in apertura", tempi.sorted()[tempi.count / 2]))
         }
 
+        // **Il riferimento: lo STESSO pannello, ma vuoto, misurato adesso e
+        // qui.** Il 10/09 il runner di GitHub (GPU paravirtualizzata) ha
+        // bocciato codice sano due corse di fila sullo stesso commit — 13,7 e
+        // poi 18,6 ms dove il Mac ne fa 6,9 — e con loro è salito anche «in
+        // apertura», che quel commit non toccava nemmeno. Quando i tre numeri
+        // salgono insieme non è il codice, è la macchina, e una soglia
+        // assoluta lì è di nuovo la moneta del 19/08. Il guscio vuoto è il
+        // metro della macchina: stesso `body`, stesse viste, zero righe da
+        // impaginare. Quello che il banco vuole sapere è quanto costa il
+        // CONTENUTO in più del guscio, e quello è un rapporto, non dei
+        // millisecondi.
+        let riferimento: Double = {
+            let vuoti = FintiDati(vuoto: true)
+            // Un giro a vuoto anche qui: il pannello senza righe usa viste che
+            // le misure di sopra non hanno costruito.
+            _ = ImageRenderer(content: pannello(geometria: geometria, aperto: true,
+                                                scheda: .deposito, inArrivo: false,
+                                                dati: vuoti, scuro: false)).cgImage
+            var tempi: [Double] = []
+            for _ in 0..<giri {
+                let inizio = DispatchTime.now().uptimeNanoseconds
+                _ = ImageRenderer(content: pannello(geometria: geometria, aperto: true,
+                                                    scheda: .deposito, inArrivo: false,
+                                                    dati: vuoti, scuro: false)).cgImage
+                tempi.append(Double(DispatchTime.now().uptimeNanoseconds - inizio) / 1_000_000)
+            }
+            return tempi.sorted()[tempi.count / 2]
+        }()
+
         // **La soglia sta a un ORDINE DI GRANDEZZA dal tipico, non a filo.**
         // Il 19/08 questo cancello ha bocciato tre volte codice sano perché
         // stava al 20% sopra il valore normale: con la macchina carica (una
@@ -292,7 +321,29 @@ enum Scatta {
         // visto (44) c'è un fattore nove: la soglia sta in mezzo, a 12 ms, e
         // da lì non si muove per rumore. Il polo negativo qui sotto prova che
         // a 12 il difetto vero lo prende ancora.
-        let soglia = 12.0
+        // **K sta in mezzo, in RAPPORTO, come il 12 sta in mezzo in
+        // millisecondi.** Misurato qui, tre corse di fila: guscio vuoto 3,80 ·
+        // 3,43 · 3,01 ms, pannello pieno 6,30 · 6,62 · 6,86, rapporto 1,66 ·
+        // 1,93 · 2,28. Il rapporto ballava del 37% fra la prima corsa e la
+        // terza — il guscio vuoto costa poco, quindi il rumore della macchina
+        // lo muove in proporzione più del pieno — e un K stretto sarebbe
+        // un'altra moneta. Dall'altra parte, il difetto più piccolo mai visto
+        // (una miniatura letta nel corpo, 44 ms) sta a 44/3,4 ≈ 13 volte il
+        // guscio, e la ricodifica del polo negativo qui sotto a più di 40.
+        // Fra 2,3 (il peggior rapporto sano) e 13 (il difetto più piccolo) K
+        // va a 5: due volte sopra il sano, due volte e mezzo sotto il difetto,
+        // le stesse proporzioni con cui il 12 sta fra il tipico e il difetto.
+        //
+        // Che sul Mac la soglia salga da 12 a ~17 ms è il prezzo, ed è
+        // accettabile: il pieno tipico resta a ~6,5, cioè lo stesso rapporto
+        // di sicurezza che il 12 dava ai 5 ms, e i 44 ms del difetto più
+        // piccolo sfondano lo stesso. Il pavimento a 12 resta perché su una
+        // macchina troppo veloce K×guscio scenderebbe sotto la storia che
+        // questo numero ha.
+        let K = 5.0
+        let soglia = max(12.0, K * riferimento)
+        print(String(format: "  guscio vuoto: %.2f ms — soglia effettiva %.2f ms (il maggiore fra 12 e %.0f×)",
+                     riferimento, soglia, K))
         var rotti = 0
         for (nome, ms) in esiti {
             let ok = ms < soglia
@@ -306,13 +357,24 @@ enum Scatta {
         // esattamente il difetto del 18/08. Se un giorno NON sfonda più la
         // soglia, il banco ha smesso di misurare e questa riga diventa rossa
         // al posto suo.
+        // **Il polo relativo, che è la claim vera di questa soglia.** Sul Mac
+        // il pavimento a 12 ms vince quasi sempre, quindi la riga sopra non
+        // dice niente sul rapporto: questa lo dice, e resta la stessa frase su
+        // qualunque macchina.
+        let piuCaro = esiti.map(\.1).max() ?? 0
+        let rapporto = riferimento > 0 ? piuCaro / riferimento : .infinity
+        let sottoK = rapporto < K
+        if !sottoK { rotti += 1 }
+        print(String(format: "  %@ rapporto pieno/vuoto: %.2f / %.2f = %.2f× (soglia %.0f×)",
+                     sottoK ? "✓" : "✗", piuCaro, riferimento, rapporto, K))
+
         let costoDifetto = misuraDifetto()
         let preso = costoDifetto > soglia
         if !preso { rotti += 1 }
         print(String(format: "  %@ polo negativo: una ricodifica nel corpo costa %.0f ms e sfonda la soglia",
                      preso ? "✓" : "✗", costoDifetto))
 
-        print(rotti == 0 ? "✓ banco della fluidità" : "✗ banco della fluidità: \(rotti) su \(esiti.count + 1)")
+        print(rotti == 0 ? "✓ banco della fluidità" : "✗ banco della fluidità: \(rotti) su \(esiti.count + 2)")
         return rotti == 0 ? 0 : 1
     }
 
