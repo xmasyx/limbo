@@ -13,9 +13,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEST="${1:-${TMPDIR:-/tmp}/Limbo-build}"
 APP="$DEST/Limbo.app"
 # La versione la può dettare chi costruisce: sul runner è il TAG a essere la
-# verità (`LIMBO_VERSION=0.6.0`), così il bundle non può dire un numero diverso
+# verità (`LIMBO_VERSION=0.6.1`), così il bundle non può dire un numero diverso
 # da quello della release che lo contiene.
-VERSION="${LIMBO_VERSION:-0.6.0}"
+VERSION="${LIMBO_VERSION:-0.6.1}"
 
 cd "$ROOT"
 
@@ -58,6 +58,12 @@ echo "▸ banco dell'aggiornamento…"
 
 echo "▸ banco di quello che è arrivato il 19/08…"
 "$BIN" --selftest-nuove
+
+# Il banco della sentinella delle schermate. Esisteva dal 6/09 e NON era un
+# cancello: e' cosi' che il difetto del 10/09 — la schermata rimessa fuori che
+# rientrava al rename — e' arrivato fino alle sue mani (C113).
+echo "▸ banco delle schermate…"
+"$BIN" --selftest-schermate
 
 # Il banco della fluidita': misura il costo di un fotogramma del pannello,
 # fermo e a meta' apertura. Nasce il 18/08 dall'impasto che lui ha visto, ed e'

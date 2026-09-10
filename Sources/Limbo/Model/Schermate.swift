@@ -30,13 +30,23 @@ final class SentinellaSchermate: ObservableObject {
     /// assorbono: la sua Scrivania ha cinque schermate vecchie, e assorbirle
     /// tutte al primo avvio sarebbe un gesto che non ha chiesto. Screenshoss
     /// fa esattamente questo e lo considero un difetto, non una funzione.
-    private var giaViste: Set<String> = []
+    ///
+    /// **Per identità, non per percorso (10/09).** Fino a stamattina questa
+    /// era una `Set<String>` di path, e bastava rinominare il file per farlo
+    /// tornare sconosciuto: lui rinominava una schermata vecchia sulla
+    /// Scrivania e se la vedeva sparire nel deposito tre secondi dopo.
+    private var giaViste: Set<Identita> = []
 
     /// I file che abbiamo appena rimesso fuori con l'annulla. Senza questa
     /// lista l'annulla è un cappio: il file torna sulla Scrivania, la
     /// sorgente scatta, e la sentinella lo riassorbe un istante dopo.
-    private var rimessiFuori: [String: Date] = [:]
-    private static let graziaAnnulla: TimeInterval = 120
+    private var rimessiFuori: [Identita: Date] = [:]
+
+    /// Quanto dura la finestra di grazia dell'annulla. **Non è `let` perché
+    /// il banco la azzera**, come fa con `StatoNotch.scadenzaArrivo`: una
+    /// grazia scaduta è lo stato che conta, cioè quello in cui il file deve
+    /// restare fuori lo stesso.
+    static var graziaAnnulla: TimeInterval = 120
 
     /// Respiro fra l'evento e la lettura: la stessa idea del watcher delle
     /// chat, e qui serve anche a lasciar finire la scrittura di macOS.
@@ -115,6 +125,76 @@ final class SentinellaSchermate: ObservableObject {
         }
     }
 
+    // MARK: - Chi è questo file (C110-C112, 10/09)
+
+    /// L'identità di un file per il sistema: il numero che gli dà il volume,
+    /// non il nome che gli dà lui.
+    ///
+    /// **Il perché sta in una misura:** rinominare e spostare dentro lo stesso
+    /// volume sono la stessa chiamata, `rename(2)`, e lasciano intatti sia
+    /// l'inode sia gli attributi estesi — cambia solo il percorso. Ricordare
+    /// il percorso vuol dire quindi dimenticare il file al primo gesto suo,
+    /// ed è esattamente il difetto del 10/09.
+    ///
+    /// `dev` sta accanto a `ino` perché un inode è unico dentro un volume e
+    /// non fra volumi: senza, una schermata su una chiavetta potrebbe
+    /// collidere con una della Scrivania e sparire dal giro senza motivo.
+    struct Identita: Hashable {
+        let dev: dev_t
+        let ino: ino_t
+    }
+
+    nonisolated static func identita(_ url: URL) -> Identita? {
+        var informazioni = stat()
+        let letto = url.withUnsafeFileSystemRepresentation { percorso -> Bool in
+            guard let percorso else { return false }
+            return stat(percorso, &informazioni) == 0
+        }
+        guard letto else { return nil }
+        return Identita(dev: informazioni.st_dev, ino: informazioni.st_ino)
+    }
+
+    /// Il marchio che scriviamo NOI sul file: «questa è già passata dal
+    /// deposito, non riprenderla da sola».
+    ///
+    /// **Si scrive all'INGRESSO, non all'uscita, ed è la correzione del
+    /// 10/09 sera (C114).** Marcarlo solo nell'annulla copriva una porta
+    /// sola. L'altra è il trascinamento fuori dal deposito, che è un `.copy`
+    /// (`Trascina.swift`): il Finder scrive sulla Scrivania una copia con gli
+    /// attributi estesi dentro, quindi con `kMDItemIsScreenCapture` addosso,
+    /// inode nuovo e — se avessimo marcato all'uscita — nessun marchio. La
+    /// sentinella la vedrebbe come una schermata appena scattata e se la
+    /// riprenderebbe. Marcando all'ingresso, **ogni copia che esce dal
+    /// deposito porta il marchio con sé**, qualunque sia la porta.
+    ///
+    /// Serve anche perché la memoria della sentinella muore col processo — un
+    /// riavvio di Limbo azzera qualunque `Set` in RAM — e perché un file può
+    /// uscire dalla cartella di cattura e tornarci giorni dopo, quando la
+    /// fotografia scattata da `attiva(cartella:)` non lo contiene più. La
+    /// decisione deve sopravvivere al file, non alla sessione, e l'unico
+    /// posto dove il file la porta con sé è il file stesso.
+    ///
+    /// **Quello che NON facciamo, ed è la scorciatoia che sembra ovvia:**
+    /// togliere `com.apple.metadata:kMDItemIsScreenCapture`. Sarebbe il modo
+    /// più corto per farla ignorare da questo giro, e romperebbe la cartella
+    /// smart «Schermate» di Spotlight, che è roba sua. Si aggiunge un
+    /// attributo nostro, non si toglie uno suo.
+    nonisolated static let marchioDeposito = "app.limbo.mac.giaDepositata"
+
+    nonisolated static func eGiaDepositata(_ url: URL) -> Bool {
+        attributo(marchioDeposito, di: url) != nil
+    }
+
+    nonisolated static func marcaGiaDepositata(_ url: URL) {
+        let dati = Data("1".utf8)
+        url.withUnsafeFileSystemRepresentation { percorso in
+            guard let percorso else { return }
+            _ = dati.withUnsafeBytes { grezzo in
+                setxattr(percorso, marchioDeposito, grezzo.baseAddress, dati.count, 0, 0)
+            }
+        }
+    }
+
     // MARK: - Quando è finita di scrivere (C100)
 
     /// L'unico pezzo preso da Screenshoss, ed è quello che vale: un file si
@@ -163,11 +243,15 @@ final class SentinellaSchermate: ObservableObject {
     /// Si accende sulla cartella corrente e **segna come già viste** le
     /// schermate che ci sono adesso. Da qui in avanti entra solo quello che
     /// nasce.
-    func attiva() {
-        let cartella = Self.cartellaDiCattura()
+    func attiva() { attiva(cartella: Self.cartellaDiCattura()) }
+
+    /// La cucitura per il banco: la cartella si può dire, e allora la
+    /// sentinella si accende su una cartella di sabbia invece che sulla sua
+    /// Scrivania. `attiva()` resta la porta dell'app e passa di qui.
+    func attiva(cartella: URL) {
         if let viva = cartellaViva, viva == cartella, sorgente != nil { return }
         ferma()
-        giaViste = Set(Self.schermateNella(cartella).map(\.path))
+        giaViste = Set(Self.schermateNella(cartella).compactMap(Self.identita))
         let fd = open(cartella.path, O_EVTONLY)
         guard fd >= 0 else {
             registro.error("non riesco ad aprire \(cartella.path, privacy: .public)")
@@ -215,27 +299,45 @@ final class SentinellaSchermate: ObservableObject {
         guard let cartella = cartellaViva, let deposito else { return }
         potaGrazia()
         for url in Self.schermateNella(cartella) {
-            let percorso = url.path
-            if giaViste.contains(percorso) { continue }
-            if rimessiFuori[percorso] != nil { continue }
+            guard let chi = Self.identita(url) else { continue }
+            if giaViste.contains(chi) { continue }
+            if rimessiFuori[chi] != nil { continue }
+            // Il marchio è l'unica memoria che sopravvive al riavvio e al
+            // viaggio fuori dalla cartella: si legge dal file, sempre.
+            if Self.eGiaDepositata(url) { giaViste.insert(chi); continue }
             guard await Self.eFerma(url) else { continue }
             let nome = url.lastPathComponent
-            giaViste.insert(percorso)
+            giaViste.insert(chi)
             guard let voce = deposito.assorbi(schermata: url) else { continue }
+            // Il marchio va sul file APPENA ENTRATO, non su quello che esce:
+            // è l'unico punto attraversato da tutte le uscite del deposito —
+            // l'annulla, il trascinamento nel Finder, «Condividi», AirDrop.
+            Self.marcaGiaDepositata(voce.url)
             registro.info("assorbita: \(nome, privacy: .public)")
             nota?(voce)
         }
     }
 
     /// L'annulla del braccio: il file torna nella cartella di cattura col suo
-    /// nome, e per due minuti la sentinella fa finta di non vederlo.
+    /// nome, e da lì in avanti è suo.
+    ///
+    /// **Tre memorie, non una, perché ognuna copre un buco delle altre**
+    /// (10/09): la grazia a tempo ferma il rimbalzo immediato della sorgente,
+    /// `giaViste` lo tiene fuori per tutta la sessione anche se lui lo
+    /// rinomina o lo sposta, e il marchio sul file è l'unica che sopravvive
+    /// al riavvio di Limbo e a un viaggio fuori dalla cartella e ritorno.
     @discardableResult
     func rimettiFuori(_ voce: VoceDeposito) -> URL? {
         guard let deposito else { return nil }
         let cartella = cartellaViva ?? Self.cartellaDiCattura()
         guard let tornato = deposito.rimettiFuori(voce, in: cartella) else { return nil }
-        rimessiFuori[tornato.path] = Date()
-        giaViste.insert(tornato.path)
+        // Ridondante dopo la marcatura all'ingresso, e si tiene: è idempotente,
+        // e copre una voce entrata nel deposito per un'altra strada.
+        Self.marcaGiaDepositata(tornato)
+        if let chi = Self.identita(tornato) {
+            rimessiFuori[chi] = Date()
+            giaViste.insert(chi)
+        }
         return tornato
     }
 

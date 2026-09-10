@@ -329,8 +329,16 @@ enum SelfTests {
         // di questo polo ha svuotato l'indice del suo deposito durante la
         // build del 6/09 (3 voci → 0, file intatti, ricostruito a mano).
         // Un banco che muta lo stato passa SEMPRE da un archivio suo.
+        //
+        // **E se lo porta via quando ha finito** (10/09): l'archivio si nomina
+        // qui fuori apposta, per poterlo cancellare dopo. Prima nasceva dentro
+        // la chiusura, senza nome che sopravvivesse, e ne restava una cartella
+        // a ogni corsa — dieci sul disco dal 6/09. Si toglie SOLO la propria,
+        // per nome intero: una spazzata su `banco-*` cancellerebbe l'archivio
+        // di un altro banco che sta girando nella stessa corsa.
+        let archivioInoltro = Archivio(cartella: "banco-inoltro-\(UUID().uuidString)")
         let ridisegna = MainActor.assumeIsolated { () -> Bool in
-            let dep = Deposito(archivio: Archivio(cartella: "banco-inoltro-\(UUID().uuidString)"))
+            let dep = Deposito(archivio: archivioInoltro)
             dep.aggiungi(url: URL(fileURLWithPath: "/tmp/y.png"), nome: "y.png", nostra: false)
             let st = StatoNotch(appunti: Appunti(perSonda: []), deposito: dep)
             var scattato = false
@@ -339,6 +347,7 @@ enum SelfTests {
             c.cancel()
             return scattato
         }
+        try? fm.removeItem(at: archivioInoltro.radice)
         prove.append(("togliere dal deposito ridisegna lo stato del notch", ridisegna))
         // **Una sonda non tocca l'archivio vero** (6/09): la prova è che aprire
         // e chiudere un pannello su un deposito per sonda lascia intatto
@@ -374,6 +383,190 @@ enum SelfTests {
         prove.append(("dopo il braccio di una schermata si apre sul deposito", dopoSchermata == .deposito))
         prove.append(("polo negativo: dopo il braccio di una chat si apre sulle chat", dopoChat == .sessioni))
 
+        // C110-C112 (10/09) — LA SCHERMATA RIMESSA FUORI RESTA SUA.
+        //
+        // Suo rilievo, riprodotto dal vivo prima di toccare il codice: una
+        // schermata rimessa fuori con l'annulla, o vecchia sulla Scrivania,
+        // **rientrava nel deposito appena lui la rinominava**. Sotto c'era
+        // che `giaViste` e `rimessiFuori` ricordavano il PERCORSO, e un
+        // rename sullo stesso volume cambia il percorso lasciando intatti
+        // inode e attributi estesi.
+        //
+        // **Ogni polo qui sotto guarda il DISCO** — il file esiste ancora
+        // dove lui l'ha lasciato? il deposito lo contiene? — e mai lo stato
+        // interno della sentinella: uno stato che si racconta bene mentre il
+        // file sparisce è precisamente il guasto che stiamo riparando.
+        //
+        // L'archivio è di sabbia e si nomina, come per il polo dell'inoltro
+        // qui sopra: `assorbi` SCRIVE (sposta il file dentro l'archivio e
+        // riscrive l'indice), e un banco che scrive non tocca mai il deposito
+        // vero di nessuno.
+        let sabbia = banco.appendingPathComponent("cattura")
+        try? fm.createDirectory(at: sabbia, withIntermediateDirectories: true)
+        let archivioBanco = Archivio(cartella: "banco-schermate-\(UUID().uuidString)")
+        defer { try? fm.removeItem(at: archivioBanco.radice) }
+
+        /// Una schermata di banco: PNG vero più l'attributo di `screencapture`.
+        func schermataDiBanco(_ nome: String, in cartella: URL) -> URL {
+            let url = cartella.appendingPathComponent(nome)
+            scriviPng(url); marca(url)
+            return url
+        }
+        func sposta(_ da: URL, _ a: URL) -> URL {
+            try? fm.moveItem(at: da, to: a)
+            return a
+        }
+        func ceAncora(_ url: URL) -> Bool { fm.fileExists(atPath: url.path) }
+
+        // La chiusura torna anche SE I GIRI SONO FINITI, e quel valore esce di
+        // qui perché il polo va aggiunto una volta sola per tutte le vie
+        // d'uscita: i due `return righe` anticipati qui dentro saltavano il
+        // polo se lo tenevo in fondo, cioè proprio nel caso in cui serve.
+        let (rimessa, giriFiniti) = MainActor.assumeIsolated { () -> ([(String, Bool)], Bool) in
+            var righe: [(String, Bool)] = []
+            var tuttiIGiriFiniti = true
+            @MainActor func giro(_ chi: SentinellaSchermate) {
+                tuttiIGiriFiniti = giraSuMain { await chi.giro() } && tuttiIGiriFiniti
+            }
+            let graziaVera = SentinellaSchermate.graziaAnnulla
+            defer { SentinellaSchermate.graziaAnnulla = graziaVera }
+            let dep = Deposito(archivio: archivioBanco)
+
+            // C111 — quella che c'era GIÀ quando la sentinella si accende.
+            var vecchia = schermataDiBanco("vecchia.png", in: sabbia)
+            let sentinella = SentinellaSchermate(deposito: dep)
+            sentinella.attiva(cartella: sabbia)
+            giro(sentinella)
+            righe.append(("una schermata già lì quando la sentinella si accende non entra",
+                          ceAncora(vecchia) && dep.voci.isEmpty))
+            // **Il polo che col codice vecchio era rosso.** `giro()` filtrava
+            // con `giaViste.contains(percorso)`: rinominata, il percorso è
+            // nuovo, la riga non scattava e il file finiva nel deposito.
+            vecchia = sposta(vecchia, sabbia.appendingPathComponent("vecchia-rinominata.png"))
+            giro(sentinella)
+            righe.append(("e RINOMINATA resta fuori lo stesso (era il difetto del 10/09)",
+                          ceAncora(vecchia) && dep.voci.isEmpty))
+
+            // C112 — il polo positivo, prima di tutto il resto: una schermata
+            // nuova entra da sola. Senza questo, «resta fuori» lo otterrei
+            // spegnendo la sentinella.
+            let nuova = schermataDiBanco("nuova.png", in: sabbia)
+            giro(sentinella)
+            righe.append(("una schermata NUOVA entra al primo giro",
+                          !ceAncora(nuova) && dep.voci.contains { $0.nome == "nuova.png" }))
+
+            // C110 — l'annulla, e poi tutto quello che lui può farle.
+            guard let voce = dep.voci.first(where: { $0.nome == "nuova.png" }),
+                  var fuori = sentinella.rimettiFuori(voce) else {
+                righe.append(("l'annulla rimette il file nella cartella di cattura", false))
+                return (righe, tuttiIGiriFiniti)
+            }
+            righe.append(("l'annulla rimette il file nella cartella di cattura",
+                          ceAncora(fuori) && dep.voci.isEmpty))
+            righe.append(("l'annulla NON toglie `kMDItemIsScreenCapture` dal suo file",
+                          SentinellaSchermate.eSchermata(fuori)))
+
+            fuori = sposta(fuori, sabbia.appendingPathComponent("rimessa-rinominata.png"))
+            giro(sentinella)
+            righe.append(("rimessa fuori e RINOMINATA: resta fuori",
+                          ceAncora(fuori) && dep.voci.isEmpty))
+
+            // Fuori dalla cartella e ritorno: il gesto che svuota la
+            // fotografia di `attiva`, perché al momento dello scatto il file
+            // lì non c'era.
+            let sotto = sabbia.appendingPathComponent("sotto", isDirectory: true)
+            try? fm.createDirectory(at: sotto, withIntermediateDirectories: true)
+            fuori = sposta(fuori, sotto.appendingPathComponent("rimessa-rinominata.png"))
+            giro(sentinella)
+            fuori = sposta(fuori, sabbia.appendingPathComponent("rimessa-tornata.png"))
+            giro(sentinella)
+            righe.append(("rimessa fuori, SPOSTATA e riportata: resta fuori",
+                          ceAncora(fuori) && dep.voci.isEmpty))
+
+            // La grazia scaduta. Due minuti passano, e il file deve restare
+            // fuori lo stesso: la grazia ferma il rimbalzo della sorgente,
+            // non è la memoria della decisione.
+            SentinellaSchermate.graziaAnnulla = 0
+            giro(sentinella)
+            righe.append(("scaduta la grazia dell'annulla, resta fuori lo stesso",
+                          ceAncora(fuori) && dep.voci.isEmpty))
+            SentinellaSchermate.graziaAnnulla = graziaVera
+
+            // Il riavvio di Limbo, nel caso peggiore: il file è FUORI dalla
+            // cartella quando la sentinella nuova si accende, quindi non entra
+            // nella sua fotografia, e la memoria in RAM è morta col processo.
+            // Qui regge solo il marchio scritto sul file.
+            sentinella.ferma()
+            let altrove = banco.appendingPathComponent("altrove", isDirectory: true)
+            try? fm.createDirectory(at: altrove, withIntermediateDirectories: true)
+            fuori = sposta(fuori, altrove.appendingPathComponent("rimessa-tornata.png"))
+            let riavviata = SentinellaSchermate(deposito: dep)
+            riavviata.attiva(cartella: sabbia)
+            fuori = sposta(fuori, altrove.appendingPathComponent("rimessa-dopo-riavvio.png"))
+            fuori = sposta(fuori, sabbia.appendingPathComponent("rimessa-dopo-riavvio.png"))
+            giro(riavviata)
+            righe.append(("riavvio di Limbo, poi rinominata e riportata: resta fuori",
+                          ceAncora(fuori) && dep.voci.isEmpty))
+
+            // C114 (10/09 sera) — IL TRASCINAMENTO FUORI DAL DEPOSITO, che è
+            // la quarta porta e quella che lui usa davvero. L'uscita per
+            // trascinamento è un `.copy` (`Trascina.swift`): il Finder scrive
+            // sulla Scrivania una copia CON gli attributi estesi dentro,
+            // quindi con `kMDItemIsScreenCapture` addosso e un inode nuovo.
+            // Marcare all'uscita non l'avrebbe mai coperta, ed è per questo
+            // che il marchio si scrive all'ingresso. La traccia sul disco
+            // erano le due copie byte-identiche di `indicatore.png` — una nel
+            // deposito, una sulla Scrivania, stesso mtime e inode diversi.
+            let daTrascinare = schermataDiBanco("trascinata.png", in: sabbia)
+            giro(riavviata)
+            guard let dentro = dep.voci.first(where: { $0.nome == "trascinata.png" }) else {
+                righe.append(("la schermata da trascinare entra nel deposito", false))
+                return (righe, tuttiIGiriFiniti)
+            }
+            righe.append(("la schermata da trascinare entra nel deposito", !ceAncora(daTrascinare)))
+            // La copia del Finder, rifatta com'è: `copyItem` passa da
+            // `copyfile(3)` e porta con sé gli attributi estesi, esattamente
+            // come `cp -p` e come il rilascio nel Finder. **Le due righe qui
+            // sotto sono la prova che la fixture è fedele:** se la copia non
+            // portasse `kMDItemIsScreenCapture` non sarebbe il caso suo, e se
+            // non portasse il marchio il polo dopo passerebbe per il motivo
+            // sbagliato.
+            let copia = sabbia.appendingPathComponent("trascinata copia.png")
+            try? fm.copyItem(at: dentro.url, to: copia)
+            righe.append(("la copia trascinata fuori porta `kMDItemIsScreenCapture` e il marchio",
+                          SentinellaSchermate.eSchermata(copia)
+                              && SentinellaSchermate.eGiaDepositata(copia)))
+            righe.append(("e ha un inode NUOVO, quindi la memoria in RAM non la conosce",
+                          SentinellaSchermate.identita(copia) != nil
+                              && SentinellaSchermate.identita(copia)
+                                  != SentinellaSchermate.identita(dentro.url)))
+            giro(riavviata)
+            righe.append(("trascinata fuori dal deposito: la copia resta sulla Scrivania",
+                          ceAncora(copia)))
+            righe.append(("e il deposito NON prende una seconda voce",
+                          dep.voci.count == 1 && !dep.voci.contains { $0.nome == "trascinata copia.png" }))
+
+            // C112 — e il polo positivo è ancora acceso dopo tutto questo,
+            // anche con il NOME di una che è già passata di qui: l'identità è
+            // l'inode, non il nome.
+            let omonima = schermataDiBanco("nuova.png", in: sabbia)
+            giro(riavviata)
+            righe.append(("dopo tutto questo, una schermata nuova col nome di una già vista ENTRA",
+                          !ceAncora(omonima) && dep.voci.contains { $0.nome == "nuova.png" }))
+            riavviata.ferma()
+            return (righe, tuttiIGiriFiniti)
+        }
+        prove.append(contentsOf: rimessa)
+        prove.append(("ogni giro del banco è finito nel tempo, non scaduto a metà", giriFiniti))
+        // **La sabbia si sgombera DOPO aver lasciato atterrare l'OCR**, e
+        // l'ordine non è pedanteria: `aggiungi` manda un `Task.detached` a
+        // leggere il testo dell'immagine, e quel lavoro riscrive l'indice
+        // quando torna. Cancellare prima vuol dire vedersi ricomparire la
+        // cartella dell'archivio un istante dopo — misurato oggi, due corse
+        // su tre l'hanno lasciata lì.
+        MainActor.assumeIsolated { attendiSecondi(0.8) }
+        try? fm.removeItem(at: archivioBanco.radice)
+
         return esito("banco delle schermate", prove)
     }
 
@@ -389,6 +582,48 @@ enum SelfTests {
     }
 
     private final class Scatola<T>: @unchecked Sendable { var valore: T? }
+
+    /// Fa girare fino in fondo un lavoro dell'attore principale — `giro()` lo
+    /// è — da un banco sincrono, **tenendo vivo il run loop**.
+    ///
+    /// `semaforo` qui sopra non serve a questo e la differenza non è di
+    /// stile: quello blocca il thread principale, che è l'esecutore
+    /// dell'attore principale, e un lavoro `@MainActor` non troverebbe mai il
+    /// suo turno. Non fallirebbe: si incastrerebbe fino al timeout, che è il
+    /// modo più lento di scoprire un banco fermo. Va bene per `eFerma`, che è
+    /// `nonisolated`, e non per questo.
+    ///
+    /// **Torna `false` se è scaduto invece di finire, e quel valore va
+    /// guardato.** Un timeout qui lascia il giro a metà, e il polo dopo legge
+    /// un disco su cui non è ancora successo niente: direbbe «la schermata non
+    /// è entrata», che è la frase di un difetto del prodotto, mentre il
+    /// difetto è del banco. Ho pagato la lezione oggi — cinque rossi su
+    /// «una schermata NUOVA entra al primo giro» mentre la macchina era
+    /// carica, e nessuno riproducibile dopo. La scadenza è larga perché
+    /// `Deposito.aggiungi` fa partire l'OCR di Vision, che al primo giro
+    /// carica i modelli e può prendersi secondi interi di CPU.
+    @MainActor @discardableResult
+    private static func giraSuMain(_ lavoro: @escaping @MainActor () async -> Void) -> Bool {
+        let fatto = DispatchSemaphore(value: 0)
+        Task { @MainActor in
+            await lavoro()
+            fatto.signal()
+        }
+        // **Il segnale si consuma UNA volta sola.** La prima stesura aspettava
+        // nella condizione del `while` e poi riprovava per sapere com'era
+        // andata: la seconda `wait` non trovava più niente e dichiarava
+        // scaduto ogni giro, anche quelli finiti in un decimo di secondo —
+        // venti corse su venti rosse. Un semaforo non si legge, si prende.
+        let scadenza = Date().addingTimeInterval(60)
+        var finito = false
+        while !finito, Date() < scadenza {
+            finito = fatto.wait(timeout: .now()) == .success
+            if !finito {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+            }
+        }
+        return finito
+    }
 
     // MARK: - La geometria del notch
 

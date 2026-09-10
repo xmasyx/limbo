@@ -160,11 +160,18 @@ swift test > /tmp/limbo-release-test.log 2>&1 || {
 say "    $(grep -oE 'Test run with [0-9]+ tests[^.]*' /tmp/limbo-release-test.log | tail -1)"
 
 say "--> the benches the build script runs"
-for banco in stringhe geometria movimento deposito chat grazia nuove aggiornamenti; do
-  ./.build/release/Limbo "--selftest-$banco" > /tmp/limbo-release-banco.log 2>&1 \
-    || { tail -20 /tmp/limbo-release-banco.log; die "bench $banco failed"; }
+# The list is READ from build-app.sh, never written here: a hand-written copy
+# went stale the day a ninth bench was added (10/09), and this gate kept saying
+# "eight benches green" while the ninth was never run.
+BENCHES="$(grep -oE -- "--selftest-[a-z]+" Scripts/build-app.sh | sort -u)"
+[ -n "$BENCHES" ] || die "no --selftest-* found in build-app.sh"
+N=0
+for flag in $BENCHES; do
+  ./.build/release/Limbo "$flag" > /tmp/limbo-release-banco.log 2>&1 \
+    || { tail -20 /tmp/limbo-release-banco.log; die "bench $flag failed"; }
+  N=$((N+1))
 done
-say "    eight benches green"
+say "    $N benches green (the ones build-app.sh runs)"
 
 say "--> the build left nothing behind"
 DIRT="$(git status --porcelain)"
