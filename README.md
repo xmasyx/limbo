@@ -14,11 +14,14 @@
 ## Install
 
 ```bash
+brew trust xmasyx/tap      # once per Mac: Homebrew loads a third-party tap only after you trust it
 brew install --cask xmasyx/tap/limbo
 xattr -dr com.apple.quarantine /Applications/Limbo.app   # once: the app is not notarized
 ```
 
-The second line is needed once. Limbo is signed with the project's own certificate but not
+The first line is needed once per Mac: recent Homebrew refuses to load a cask from a tap that is not its own (`Refusing to load cask … from untrusted tap`) until you trust it, and it remembers the choice.
+
+The `xattr` line is needed once. Limbo is signed with the project's own certificate but not
 notarized by Apple, so without it macOS refuses to open the app (System Settings → Privacy &
 Security → *Open Anyway* does the same thing). After that Limbo updates itself: **Settings →
 Updates → Verifica aggiornamenti** runs `brew upgrade`, clears the flag on the new copy and
